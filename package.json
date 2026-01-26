@@ -2,17 +2,6 @@
   "name": "AI_Server_Environment",
   "version": "1.0.0",
   "description": "",
-  "homepage": "https://github.com/CHAI-Student/AI_Server_Environment#readme",
-  "bugs": {
-    "url": "https://github.com/CHAI-Student/AI_Server_Environment/issues"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/CHAI-Student/AI_Server_Environment.git"
-  },
-  "license": "ISC",
-  "author": "",
-  "type": "commonjs",
   "main": "index.js",
   "scripts": {
     "start": "node server/index.js",
@@ -23,16 +12,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CHAI-Student/Edge_Environment.git"
+    "url": "git+https://github.com/CHAI-Student/AI_Server_Environment.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/CHAI-Student/Edge_Environment/issues"
+    "url": "https://github.com/CHAI-Student/AI_Server_Environment/issues"
   },
-  "homepage": "https://github.com/CHAI-Student/Edge_Environment#readme",
+  "homepage": "https://github.com/CHAI-Student/AI_Server_Environment/#readme",
   "dependencies": {
     "axios": "^1.13.2",
     "bcrypt": "^6.0.0",
