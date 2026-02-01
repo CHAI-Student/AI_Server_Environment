@@ -5,6 +5,9 @@ const crypto = require("crypto");
 const path = require("path");
 const Minio = require("minio");
 const config = require("../../config/key");
+const mime = require("mime-types"); // npm i mime-types (선택이지만 권장)
+const archiver = require("archiver");
+const unzipper = require("unzipper");
 
 //=================================
 //        Product Upload
@@ -50,6 +53,7 @@ function putObjectAsync(minioClient, bucket, key, buffer, meta) {
 //=================================
 //       MinIO Image Upload
 //=================================
+// 이미지 업로드
 router.post("/uploads/images", (req, res) => {
 
     console.log('req', req.body)
@@ -141,6 +145,188 @@ router.post("/uploads/images", (req, res) => {
     });
 
 });
+
+// 리뷰용 이미지 리스트 가져오기
+router.get("/review/images", async (req, res) => {
+  try {
+    const minioClient = req.app.locals.minioClient;
+    const BUCKET = req.app.locals.minioBucket || "chaiimage";
+    if (!minioClient) {
+      return res.status(500).json({ success: false, err: "minioClient not initialized" });
+    }
+
+    // 예: productImg/123_20260122_170612/done/ 처럼 완료 폴더를 쓰면 prefix로 받기
+    const prefix = (req.query.prefix || "").toString(); // ""면 버킷 전체(비추)
+    const recursive = String(req.query.recursive || "true") === "true";
+
+    const items = [];
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, recursive);
+
+    stream.on("data", (obj) => {
+      if (!obj?.name) return;
+      if (!obj.name.match(/\.(png|jpg|jpeg|webp)$/i)) return;
+
+      items.push({
+        key: obj.name,
+        size: obj.size,
+        lastModified: obj.lastModified,
+        etag: obj.etag,
+      });
+    });
+
+    stream.on("error", (err) => {
+      return res.status(500).json({ success: false, err: String(err) });
+    });
+
+    stream.on("end", () => {
+      return res.json({ success: true, bucket: BUCKET, prefix, items });
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
+});
+
+// 리뷰용 이미지 다운로드
+router.get("/review/folder/download-zip", async (req, res) => {
+  const prefix = (req.query.prefix || "").toString();
+  if (!prefix) return res.status(400).json({ success: false, err: "prefix is required" });
+
+  try {
+    const minioClient = req.app.locals.minioClient;
+    const BUCKET = req.app.locals.minioBucket || "chaiimage";
+    if (!minioClient) return res.status(500).json({ success: false, err: "minioClient not initialized" });
+
+    const zipName =
+      (req.query.name || prefix.replace(/\/+$/, "").split("/").pop() || "folder") + ".zip";
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+    res.setHeader("Cache-Control", "no-store");
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (err) => {
+      try { res.status(500).end(String(err)); } catch {}
+    });
+
+    // 응답 스트림에 zip 연결
+    archive.pipe(res);
+
+    // prefix 아래 object 리스트업
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
+
+    const addObjectToZip = (key) =>
+      new Promise((resolve, reject) => {
+        minioClient.getObject(BUCKET, key, (err, objStream) => {
+          if (err) return reject(err);
+
+          // zip 안에서는 prefix를 제거해서 상대경로로 담기
+          const rel = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+          if (!rel || rel.endsWith("/")) return resolve(); // 폴더 엔트리 무시
+
+          objStream.on("error", reject);
+
+          // 파일명 중간에 이상한 문자 들어갈 수 있으니 방어(선택)
+          const safeRel = rel.replace(/\\/g, "/").replace(/^\/*/, "").replace(/\.\./g, "_");
+
+          archive.append(objStream, { name: safeRel });
+          resolve();
+        });
+      });
+
+    const tasks = [];
+    stream.on("data", (obj) => {
+      if (!obj?.name) return;
+      // 폴더 엔트리 방지
+      if (obj.name.endsWith("/")) return;
+      tasks.push(addObjectToZip(obj.name));
+    });
+
+    stream.on("error", async (err) => {
+      try { await archive.abort(); } catch {}
+      return res.status(500).end(String(err));
+    });
+
+    stream.on("end", async () => {
+      try {
+        await Promise.all(tasks);
+        await archive.finalize();
+      } catch (e) {
+        try { await archive.abort(); } catch {}
+        // 이미 헤더 보냈으면 json 못 보냄 → 그냥 종료
+        try { res.end(String(e)); } catch {}
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
+});
+
+
+// 리뷰용 이미지 덮어쓰기
+const uploadZip = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 500 * 1024 * 1024 }, // 예: 500MB 제한(상황 맞게 조정)
+}).single("zip");
+
+router.post("/review/folder/upload-zip-overwrite", (req, res) => {
+  uploadZip(req, res, async (err) => {
+    try {
+      if (err) return res.status(400).json({ success: false, err: String(err) });
+
+      const minioClient = req.app.locals.minioClient;
+      const BUCKET = req.app.locals.minioBucket || "chaiimage";
+      if (!minioClient) return res.status(500).json({ success: false, err: "minioClient not initialized" });
+
+      const prefix = (req.body.prefix || "").toString();
+      if (!prefix) return res.status(400).json({ success: false, err: "prefix is required" });
+
+      if (!req.file?.buffer) return res.status(400).json({ success: false, err: "zip file is required (field name: zip)" });
+
+      // zip 풀어서 엔트리별로 putObject(같은 key로 overwrite)
+      const directory = await unzipper.Open.buffer(req.file.buffer);
+
+      // 보안: prefix 밖으로 탈출(../) 방지
+      const normalizeRel = (p) =>
+        String(p || "")
+          .replace(/\\/g, "/")
+          .replace(/^\/*/, "")
+          .replace(/\.\./g, "_");
+
+      let uploadedCount = 0;
+
+      for (const entry of directory.files) {
+        if (entry.type !== "File") continue;
+
+        const rel = normalizeRel(entry.path);
+        if (!rel) continue;
+
+        const key = `${prefix.replace(/\/+$/, "")}/${rel}`;
+
+        const contentType = mime.lookup(rel) || "application/octet-stream";
+
+        // entry.stream()은 ReadableStream
+        await new Promise((resolve, reject) => {
+          minioClient.putObject(
+            BUCKET,
+            key,
+            entry.stream(),
+            { "Content-Type": contentType },
+            (e, etag) => {
+              if (e) return reject(e);
+              uploadedCount += 1;
+              resolve(etag);
+            }
+          );
+        });
+      }
+
+      return res.json({ success: true, bucket: BUCKET, prefix, uploadedCount });
+    } catch (e) {
+      return res.status(500).json({ success: false, err: e?.message || String(e) });
+    }
+  });
+});
+
 
 
 //=================================
