@@ -23,6 +23,7 @@
   },
   "homepage": "https://github.com/CHAI-Student/AI_Server_Environment/#readme",
   "dependencies": {
+    "archiver": "^7.0.1",
     "axios": "^1.13.2",
     "bcrypt": "^6.0.0",
     "cookie-parser": "^1.4.7",
@@ -39,6 +40,7 @@
     "pino": "^10.1.1",
     "pm2": "^6.0.14",
     "serialport": "^13.0.0",
+    "unzipper": "^0.12.3",
     "uuid": "^13.0.0",
     "zod": "^4.3.5"
   },

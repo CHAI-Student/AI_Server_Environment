@@ -61,11 +61,16 @@ app.use(function (req, res, next) {
 //use this to show the image you have in node js server to client (react js)
 //https://stackoverflow.com/questions/48914987/send-image-path-from-node-js-express-server-to-react-client
 
-// const productRouter = require("../server/routes/AIServer/Products"); // 네 라우터 파일 경로
-// app.use("/api", productRouter);
+const productRouter = require("./routes/products"); // 상품 및 어노테이션 라우터
+app.use("/api", productRouter);
 
 app.use('/products', express.static('uploads'));
 app.use('/uploads/images', express.static('images'));
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ ok: true });
+});
 
 // Serve static assets if in production
 if (process.env.NODE_ENV === "production") {
@@ -82,6 +87,33 @@ if (process.env.NODE_ENV === "production") {
 
 const port = process.env.PORT || 9000;
 
+// GPU 서버 상태 확인 helper
+async function checkGpuHealth() {
+  const url = 'http://139.150.8.82:2140/health';
+  try {
+    const resp = await axios.get(url, { timeout: 3000 });
+    console.log(`[GPU-HEALTH] OK - ${url} ->`, resp.data);
+    return resp.data;
+  } catch (err) {
+    console.error(`[GPU-HEALTH] FAIL - ${url} ->`, err.message || err);
+    return null;
+  }
+}
+
+// 간단한 프록시 엔드포인트 (로컬에서 GPU 헬스 체크 확인용)
+app.get('/gpu-health', async (req, res) => {
+  const data = await checkGpuHealth();
+  if (data) {
+    res.json({ success: true, data });
+  } else {
+    res.status(502).json({ success: false, err: 'gpu health check failed' });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server Listening on ${port}`);
+  // 서버 시작 시 GPU 서버 헬스 체크 한 번 실행
+  checkGpuHealth();
+  // 이후에는 주기적으로 확인하고 싶다면 아래처럼 설정
+  // setInterval(checkGpuHealth, 1000 * 60 * 5); // 5분마다
 });

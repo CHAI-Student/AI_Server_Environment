@@ -4,10 +4,87 @@ const multer = require("multer");
 const crypto = require("crypto");
 const path = require("path");
 const Minio = require("minio");
-const config = require("../../config/key");
+const mongoose = require("mongoose");
+const axios = require("axios");
+// const config = require("../../config/key");
 const mime = require("mime-types"); // npm i mime-types (선택이지만 권장)
 const archiver = require("archiver");
 const unzipper = require("unzipper");
+const { PassThrough } = require('stream');
+
+// Helper function for SHA1 hash
+function sha1(data) {
+  return crypto.createHash("sha1").update(data).digest("hex").slice(0, 8);
+}
+
+// Helper function: GPU 서버로 어노테이션 완료 알림 전송
+async function notifyGPUServer(folderName) {
+  try {
+    // folderName format: {divisionIdx}_{storageType}_{trainingProductIdx}_{productIdx}
+    // 예: DE17560868094789999_C_40_P17701739459661615
+    const parts = folderName.split('_').filter((p) => p !== '');
+    // divisionIdx is first element if it contains any letter, else undefined
+    let divisionIdx = '';
+    let productIdx = '';
+    if (parts.length > 0) {
+      // assume productIdx is last part that begins with 'P' or is numeric
+      productIdx = parts[parts.length - 1];
+      // divisionIdx as first non-numeric segment
+      for (const p of parts) {
+        if (!/^\d+$/.test(p) && !/^P\d+$/.test(p)) {
+          divisionIdx = p;
+          break;
+        }
+      }
+      if (!divisionIdx && parts.length >= 2) {
+        divisionIdx = parts[0];
+      }
+    }
+
+    if (!productIdx) {
+      console.error('[GPU_NOTIFY] Failed to extract product_idx from folderName:', folderName);
+      return;
+    }
+    if (!divisionIdx) {
+      // divisionIdx is optional; log warning but continue
+      console.warn('[GPU_NOTIFY] division_idx not found, using empty string');
+    }
+
+    // 시스템 ID 생성 (WEB-날짜-시퀀스)
+    const now = new Date();
+    const dateStr = String(now.getFullYear()).slice(-2) + 
+                    String(now.getMonth() + 1).padStart(2, '0') + 
+                    String(now.getDate()).padStart(2, '0');
+    const timeStr = String(now.getHours()).padStart(2, '0') +
+                    String(now.getMinutes()).padStart(2, '0') +
+                    String(now.getSeconds()).padStart(2, '0');
+    const ifSysId = `WEB-${dateStr}-${Math.floor(Math.random() * 999999).toString().padStart(6, '0')}`;
+    const ifDate = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}${timeStr}`;
+
+    const payload = {
+      HEADER: {
+        IF_ID: 'IF_WEB_01',
+        IF_SYSID: ifSysId,
+        IF_HOST: 'WEB',
+        IF_DATE: ifDate,
+      },
+      DATA: {
+        division_idx: divisionIdx,
+        product_idx: productIdx,
+      },
+    };
+
+    const response = await axios.post('http://139.150.8.82:2140/v1/events/annotation/completed', payload, {
+      timeout: 5000,
+    });
+
+    console.log('[GPU_NOTIFY] Success:', response.data);
+    return response.data;
+  } catch (e) {
+    console.error('[GPU_NOTIFY] Error:', e?.message || String(e));
+    // 에러가 발생해도 업로드는 성공으로 처리 (비동기 알림)
+  }
+}
 
 //=================================
 //        Product Upload
@@ -367,6 +444,766 @@ router.post("/products", async (req, res) => {
     } catch (e) {
         return res.status(500).json({ success: false, err: e?.message || String(e) });
     }
+});
+
+//=================================
+//   Annotation Review (검수용)
+//=================================
+
+// NewAnnotation 경로의 모든 폴더 목록 조회
+// 폴더 구조 파싱: /NewAnnotation/{divisionIdx}_{trainingProductIdx}_{productIdx}
+router.get("/annotation/list-all", async (req, res) => {
+  try {
+    const minioClient = req.app.locals.minioClient;
+    const BUCKET = req.app.locals.minioBucket || "chaiimage";
+    if (!minioClient) {
+      return res.status(500).json({ success: false, err: "minioClient not initialized" });
+    }
+
+    const prefix = "NewAnnotation/";
+    const folderMap = new Map(); // {folderName: {count, size}}
+
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, false); // non-recursive로 폴더만 조회
+
+    stream.on("data", (obj) => {
+      // MinIO may return either { name: '…' } or { prefix: '…' } when recursive is false
+      const key = obj.name || obj.prefix;
+      if (!key || !key.startsWith(prefix)) return;
+
+      // /NewAnnotation/D001_T001_P123/ 형태에서 D001_T001_P123 추출
+      const rel = key.slice(prefix.length);
+      const folderName = rel.split("/")[0];
+
+      if (folderName && folderName !== "") {
+        if (!folderMap.has(folderName)) {
+          folderMap.set(folderName, { name: folderName, files: [], totalSize: 0 });
+        }
+      }
+    });
+
+    stream.on("error", (err) => {
+      return res.status(500).json({ success: false, err: String(err) });
+    });
+
+    stream.on("end", async () => {
+      // 각 폴더 내 파일 개수 및 크기 계산
+      const folders = [];
+
+      for (const [folderName, folderInfo] of folderMap) {
+        const folderPrefix = `${prefix}${folderName}`;
+        let fileCount = 0;
+        let totalSize = 0;
+
+        const fileStream = minioClient.listObjectsV2(BUCKET, folderPrefix, true);
+
+        await new Promise((resolve, reject) => {
+          fileStream.on("data", (obj) => {
+            if (obj?.name && !obj.name.endsWith("/")) {
+              fileCount++;
+              totalSize += obj.size || 0;
+            }
+          });
+
+          fileStream.on("error", reject);
+
+          fileStream.on("end", () => {
+            folders.push({
+              folderName,
+              prefix: folderPrefix,
+              fileCount,
+              totalSize,
+              createdAt: new Date(),
+            });
+            resolve();
+          });
+        });
+      }
+
+      // attach product info from ProductsList
+      const coll = mongoose.connection.db.collection('ProductsList');
+      await Promise.all(
+        folders.map(async (f) => {
+          // extract productIdx: assume last segment after '_'
+          const parts = f.folderName.split('_');
+          const prod = parts[parts.length - 1];
+          f.productIdx = prod;
+          try {
+            const doc = await coll.findOne({ productIdx: prod }, { projection: { productEngName: 1 } });
+            f.productEngName = doc?.productEngName || '';
+          } catch {
+            f.productEngName = '';
+          }
+        })
+      );
+
+      return res.json({
+        success: true,
+        bucket: BUCKET,
+        prefix,
+        folders: folders.sort((a, b) => b.fileCount - a.fileCount),
+        totalFolders: folders.length,
+      });
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
+});
+
+// endpoint for retrieving single product info
+router.get('/product/:productIdx', async (req, res) => {
+  try {
+    const productIdx = (req.params.productIdx || '').toString();
+    if (!productIdx) return res.status(400).json({ success: false, err: 'productIdx required' });
+    const coll = mongoose.connection.db.collection('ProductsList');
+    const doc = await coll.findOne({ productIdx });
+    if (!doc) return res.status(404).json({ success: false, err: 'not found' });
+    return res.json({ success: true, product: doc });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
+});
+
+
+
+// 특정 어노테이션 폴더 다운로드 (Zip)
+router.get("/annotation/download-zip", async (req, res) => {
+  try {
+    const minioClient = req.app.locals.minioClient;
+    const BUCKET = req.app.locals.minioBucket || "chaiimage";
+    if (!minioClient) {
+      return res.status(500).json({ success: false, err: "minioClient not initialized" });
+    }
+
+    const folderName = (req.query.folderName || "").toString();
+    if (!folderName) {
+      return res.status(400).json({ success: false, err: "folderName is required" });
+    }
+
+    const prefix = `NewAnnotation/${folderName}`;
+    const zipName = `${folderName}.zip`;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+    res.setHeader("Cache-Control", "no-store");
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (err) => {
+      try { res.status(500).end(String(err)); } catch {}
+    });
+
+    archive.pipe(res);
+
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
+
+    const addObjectToZip = (key) =>
+      new Promise((resolve, reject) => {
+        minioClient.getObject(BUCKET, key, (err, objStream) => {
+          if (err) return reject(err);
+
+          const rel = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+          if (!rel || rel.endsWith("/")) return resolve();
+
+          objStream.on("error", reject);
+          const safeRel = rel.replace(/\\/g, "/").replace(/^\/*/, "").replace(/\.\./g, "_");
+          archive.append(objStream, { name: safeRel });
+          resolve();
+        });
+      });
+
+    const tasks = [];
+    stream.on("data", (obj) => {
+      if (!obj?.name) return;
+      if (obj.name.endsWith("/")) return;
+      tasks.push(addObjectToZip(obj.name));
+    });
+
+    stream.on("error", async (err) => {
+      try { await archive.abort(); } catch {}
+      return res.status(500).end(String(err));
+    });
+
+    stream.on("end", async () => {
+      try {
+        await Promise.all(tasks);
+        await archive.finalize();
+      } catch (e) {
+        try { await archive.abort(); } catch {}
+        try { res.end(String(e)); } catch {}
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
+});
+
+// 검수 완료 후 Zip 업로드
+const uploadZipAnnotation = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 500 * 1024 * 1024 },
+}).single("zip");
+
+router.post("/annotation/upload-verified", (req, res) => {
+  uploadZipAnnotation(req, res, async (err) => {
+    // 요청이 들어왔음을 빠르게 찍어둠
+    console.log('[UPLOAD_HANDLER] request received');
+    try {
+      if (err) {
+        console.error("[UPLOAD ERROR] Multer error:", err);
+        return res.status(400).json({ success: false, err: String(err) });
+      }
+
+      const minioClient = req.app.locals.minioClient;
+      const BUCKET = req.app.locals.minioBucket || "chaiimage";
+      if (!minioClient) return res.status(500).json({ success: false, err: "minioClient not initialized" });
+
+      const folderName = (req.body.folderName || "").toString();
+      if (!folderName) {
+        return res.status(400).json({ success: false, err: "folderName is required" });
+      }
+
+      if (!req.file?.buffer) {
+        console.error("[UPLOAD ERROR] No file buffer received");
+        return res.status(400).json({ success: false, err: "zip file is required (field name: zip)" });
+      }
+
+      console.log(`[UPLOAD] File received. Size: ${req.file.buffer.length} bytes, Original name: ${req.file.originalname}`);
+
+      const trainProductIdx = (req.body.trainProductIdx || "").toString();
+      const productEngName = (req.body.productEngName || "").toString();
+
+      if (!trainProductIdx || !productEngName) {
+        return res.status(400).json({
+          success: false,
+          err: "trainProductIdx and productEngName are required",
+        });
+      }
+
+      // 새로운 업로드 경로
+      const now = new Date();
+      // format as YYYYMMDD_HHMMSS (year-month-day _ hour-minute-second)
+      const pad = (n) => String(n).padStart(2, "0");
+      const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+      const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+      const dateTimeStr = `${date}_${time}`;
+
+      const uploadPrefix = `productAnnotation/${trainProductIdx}_${productEngName}_${dateTimeStr}`;
+
+      // Zip 풀어서 업로드 (streaming parse 사용)
+      const normalizeRel = (p) =>
+        String(p || "")
+          .replace(/\\/g, "/")
+          .replace(/^\/*/, "")
+          .replace(/\.\./g, "_");
+
+      const bufferStream = new PassThrough();
+      bufferStream.end(req.file.buffer);
+
+      let uploadedCount = 0;
+      let pending = 0;
+      let streamErr = null;
+      let skippedFiles = []; // zero-length or errors
+
+      await new Promise((resolve, reject) => {
+        bufferStream
+          .pipe(unzipper.Parse())
+          .on('entry', (entry) => {
+            if (streamErr) {
+              entry.autodrain();
+              return;
+            }
+
+            if (entry.type !== 'File') {
+              entry.autodrain();
+              return;
+            }
+
+            const rel = normalizeRel(entry.path);
+            if (!rel) {
+              entry.autodrain();
+              return;
+            }
+
+            // Note: do not skip based on entry.vars here; we'll inspect actual stream bytes
+            // to determine zero-length entries. Some archives report 0 in metadata
+            // even though data exists, so rely on streaming bytes instead.
+
+            const key = `${uploadPrefix}/${rel}`;
+            const contentType = mime.lookup(rel) || 'application/octet-stream';
+
+            pending += 1;
+            console.log(`[ZIP_UPLOAD] processing entry ${entry.path} size=${entry.vars?.uncompressedSize || '?'} compressed=${entry.vars?.compressedSize || '?'} `);
+            try {
+              // Collect entry into a PassThrough so we can determine if it's empty
+              const tmp = new PassThrough();
+              let totalBytes = 0;
+
+              entry.on('data', (chunk) => {
+                totalBytes += chunk.length;
+                tmp.write(chunk);
+              });
+
+              entry.on('end', () => {
+                tmp.end();
+
+                if (totalBytes === 0) {
+                  console.warn('[ZIP_UPLOAD] skipping zero-length file (stream) ', entry.path);
+                  skippedFiles.push(entry.path);
+                  pending -= 1;
+                  return;
+                }
+
+                // now upload the collected stream to MinIO
+                try {
+                  minioClient.putObject(BUCKET, key, tmp, { 'Content-Type': contentType }, (e, etag) => {
+                    pending -= 1;
+                    if (e) {
+                      console.error(`[ZIP_UPLOAD] putObject error for ${entry.path}:`, e.message);
+                      if (e.message && e.message.includes('You must specify at least one part')) {
+                        console.warn(`[ZIP_UPLOAD] skipping empty entry ${entry.path}`);
+                        return;
+                      }
+                      streamErr = e;
+                      return reject(e);
+                    }
+                    uploadedCount += 1;
+                    console.log(`[ZIP_UPLOAD] uploaded ${entry.path}`);
+                  });
+                } catch (e) {
+                  pending -= 1;
+                  streamErr = e;
+                  return reject(e);
+                }
+              });
+
+              entry.on('error', (e) => {
+                tmp.end();
+                pending -= 1;
+                streamErr = e;
+                return reject(e);
+              });
+            } catch (e) {
+              pending -= 1;
+              streamErr = e;
+              entry.autodrain();
+              return reject(e);
+            }
+          })
+          .on('close', () => {
+            if (streamErr) return reject(streamErr);
+            const wait = () => {
+              if (pending === 0) return resolve();
+              setTimeout(wait, 50);
+            };
+            wait();
+          })
+          .on('error', (e) => {
+            streamErr = e;
+            return reject(e);
+          });
+      });
+
+      // 응답 전송
+      if (uploadedCount === 0) {
+        console.warn('[UPLOAD] no valid files found inside zip', folderName, 'skipped', skippedFiles.length);
+        // 디버깅: 서버에 zip 덤프
+        try {
+          const dumpPath = `/tmp/debug-${Date.now()}.zip`;
+          require('fs').writeFileSync(dumpPath, req.file.buffer);
+          console.warn('[UPLOAD] dumped zip to', dumpPath);
+        } catch (e) {
+          console.error('[UPLOAD] failed to dump zip for debugging', e.message);
+        }
+        return res.status(400).json({
+          success: false,
+          err: 'ZIP에 업로드할 수 있는 유효한 파일이 없습니다',
+          skipped: skippedFiles.slice(0, 10), // 최대 10개 예시
+        });
+      }
+
+      res.json({
+        success: true,
+        bucket: BUCKET,
+        uploadPrefix,
+        uploadedCount,
+        folderName,
+        skippedCount: skippedFiles.length,
+        skipped: skippedFiles.length > 0 ? skippedFiles.slice(0,10) : undefined,
+        message: `Uploaded ${uploadedCount} files to ${uploadPrefix}`,
+      });
+
+      // 비동기로 GPU 서버에 알림 전송 (응답 후 백그라운드에서 실행)
+      setImmediate(() => {
+        notifyGPUServer(folderName).catch((e) => {
+          console.error('[GPU_NOTIFY] Error notification failed:', e?.message || String(e));
+        });
+      });
+    } catch (e) {
+      return res.status(500).json({ success: false, err: e?.message || String(e) });
+    }
+  });
+});
+
+// NewAnnotation 폴더 삭제
+router.delete("/annotation/delete-folder", async (req, res) => {
+  try {
+    const minioClient = req.app.locals.minioClient;
+    const BUCKET = req.app.locals.minioBucket || "chaiimage";
+    if (!minioClient) return res.status(500).json({ success: false, err: "minioClient not initialized" });
+
+    const folderName = (req.query.folderName || "").toString();
+    if (!folderName) {
+      return res.status(400).json({ success: false, err: "folderName is required" });
+    }
+
+    const prefix = `NewAnnotation/${folderName}`;
+
+    // 폴더 내 모든 파일 삭제
+    let deletedCount = 0;
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
+
+    const filesToDelete = [];
+    stream.on("data", (obj) => {
+      if (!obj?.name || obj.name.endsWith("/")) return;
+      filesToDelete.push(obj.name);
+    });
+
+    stream.on("error", (err) => {
+      return res.status(500).json({ success: false, err: String(err) });
+    });
+
+    stream.on("end", async () => {
+      if (filesToDelete.length > 0) {
+        await Promise.all(
+          filesToDelete.map(
+            (key) =>
+              new Promise((resolve) => {
+                minioClient.removeObject(BUCKET, key, (err) => {
+                  if (!err) deletedCount += 1;
+                  resolve();
+                });
+              })
+          )
+        );
+      }
+
+      return res.json({
+        success: true,
+        bucket: BUCKET,
+        prefix,
+        folderName,
+        deletedCount,
+        message: `Deleted ${deletedCount} files from ${prefix}`,
+      });
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
+});
+
+// 기존 API들 (호환성 유지)
+// 검수 대상 어노테이션 목록 조회
+// 경로: /NewAnnotation/{divisionIdx}_{trainingProductIdx}_{ProductIdx}
+router.get("/annotation/list-new", async (req, res) => {
+  try {
+    const minioClient = req.app.locals.minioClient;
+    const BUCKET = req.app.locals.minioBucket || "chaiimage";
+    if (!minioClient) {
+      return res.status(500).json({ success: false, err: "minioClient not initialized" });
+    }
+
+    // query params: divisionIdx, trainingProductIdx, productIdx
+    const divisionIdx = (req.query.divisionIdx || "").toString();
+    const trainingProductIdx = (req.query.trainingProductIdx || "").toString();
+    const productIdx = (req.query.productIdx || "").toString();
+
+    if (!divisionIdx || !trainingProductIdx || !productIdx) {
+      return res.status(400).json({
+        success: false,
+        err: "divisionIdx, trainingProductIdx, productIdx are required",
+      });
+    }
+
+    // prefix 구성: /NewAnnotation/{divisionIdx}_{trainingProductIdx}_{ProductIdx}
+    const prefix = `NewAnnotation/${divisionIdx}_${trainingProductIdx}_${productIdx}`;
+
+    const items = [];
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
+
+    stream.on("data", (obj) => {
+      if (!obj?.name) return;
+      // 폴더 엔트리 제외
+      if (obj.name.endsWith("/")) return;
+
+      items.push({
+        key: obj.name,
+        size: obj.size,
+        lastModified: obj.lastModified,
+        etag: obj.etag,
+      });
+    });
+
+    stream.on("error", (err) => {
+      return res.status(500).json({ success: false, err: String(err) });
+    });
+
+    stream.on("end", () => {
+      return res.json({
+        success: true,
+        bucket: BUCKET,
+        prefix,
+        folderName: `${divisionIdx}_${trainingProductIdx}_${productIdx}`,
+        items,
+        count: items.length,
+      });
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
+});
+
+// 검수 대상 어노테이션 Zip 다운로드
+router.get("/annotation/download-new-zip", async (req, res) => {
+  try {
+    const minioClient = req.app.locals.minioClient;
+    const BUCKET = req.app.locals.minioBucket || "chaiimage";
+    if (!minioClient) {
+      return res.status(500).json({ success: false, err: "minioClient not initialized" });
+    }
+
+    // query params
+    const divisionIdx = (req.query.divisionIdx || "").toString();
+    const trainingProductIdx = (req.query.trainingProductIdx || "").toString();
+    const productIdx = (req.query.productIdx || "").toString();
+
+    if (!divisionIdx || !trainingProductIdx || !productIdx) {
+      return res.status(400).json({
+        success: false,
+        err: "divisionIdx, trainingProductIdx, productIdx are required",
+      });
+    }
+
+    const prefix = `NewAnnotation/${divisionIdx}_${trainingProductIdx}_${productIdx}`;
+    const zipName = `${divisionIdx}_${trainingProductIdx}_${productIdx}.zip`;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+    res.setHeader("Cache-Control", "no-store");
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (err) => {
+      try { res.status(500).end(String(err)); } catch {}
+    });
+
+    archive.pipe(res);
+
+    // MinIO에서 prefix 아래 파일 조회
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
+
+    const addObjectToZip = (key) =>
+      new Promise((resolve, reject) => {
+        minioClient.getObject(BUCKET, key, (err, objStream) => {
+          if (err) return reject(err);
+
+          // zip 내에서는 prefix 제거하고 상대경로로 저장
+          const rel = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+          if (!rel || rel.endsWith("/")) return resolve();
+
+          objStream.on("error", reject);
+
+          const safeRel = rel.replace(/\\/g, "/").replace(/^\/*/, "").replace(/\.\./g, "_");
+          archive.append(objStream, { name: safeRel });
+          resolve();
+        });
+      });
+
+    const tasks = [];
+    stream.on("data", (obj) => {
+      if (!obj?.name) return;
+      if (obj.name.endsWith("/")) return;
+      tasks.push(addObjectToZip(obj.name));
+    });
+
+    stream.on("error", async (err) => {
+      try { await archive.abort(); } catch {}
+      return res.status(500).end(String(err));
+    });
+
+    stream.on("end", async () => {
+      try {
+        await Promise.all(tasks);
+        await archive.finalize();
+      } catch (e) {
+        try { await archive.abort(); } catch {}
+        try { res.end(String(e)); } catch {}
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
+});
+
+// 검수 완료 어노테이션 업로드 및 원본 삭제 (기존 - deprecated)
+// POST body:
+//   - divisionIdx, trainingProductIdx, productIdx (원본 경로)
+//   - trainProductIdx, productEngName (새 경로용) 또는 uploadPrefix 직접 지정
+//   - zip file (field name: "zip")
+const uploadZipAnnotationDeprecated = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB
+}).single("zip");
+
+router.post("/annotation/upload-verified-with-delete", (req, res) => {
+  uploadZipAnnotationDeprecated(req, res, async (err) => {
+    try {
+      if (err) return res.status(400).json({ success: false, err: String(err) });
+
+      const minioClient = req.app.locals.minioClient;
+      const BUCKET = req.app.locals.minioBucket || "chaiimage";
+      if (!minioClient) return res.status(500).json({ success: false, err: "minioClient not initialized" });
+
+      // 필수 params
+      const divisionIdx = (req.body.divisionIdx || "").toString();
+      const trainingProductIdx = (req.body.trainingProductIdx || "").toString();
+      const productIdx = (req.body.productIdx || "").toString();
+
+      if (!divisionIdx || !trainingProductIdx || !productIdx) {
+        return res.status(400).json({
+          success: false,
+          err: "divisionIdx, trainingProductIdx, productIdx are required",
+        });
+      }
+
+      if (!req.file?.buffer) {
+        return res.status(400).json({ success: false, err: "zip file is required (field name: zip)" });
+      }
+
+      // 원본 경로
+      const originalPrefix = `NewAnnotation/${divisionIdx}_${trainingProductIdx}_${productIdx}`;
+
+      // 새로운 업로드 경로 (검수 완료)
+      // /productAnnotation/{trainProductIdx}_{productEngName}_{날짜시간} 형식
+      let uploadPrefix = req.body.uploadPrefix;
+      if (!uploadPrefix) {
+        const trainProductIdx = (req.body.trainProductIdx || trainingProductIdx).toString();
+        const productEngName = (req.body.productEngName || "unknown").toString();
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, "0");
+        const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+        const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+        const dateTimeStr = `${date}_${time}`;
+
+        uploadPrefix = `productAnnotation/${trainProductIdx}_${productEngName}_${dateTimeStr}`;
+      }
+
+      // Zip 파일 풀어서 업로드
+      const directory = await unzipper.Open.buffer(req.file.buffer);
+
+      const normalizeRel = (p) =>
+        String(p || "")
+          .replace(/\\/g, "/")
+          .replace(/^\/*/, "")
+          .replace(/\.\./g, "_");
+
+      let uploadedCount = 0;
+
+      for (const entry of directory.files) {
+        if (entry.type !== "File") continue;
+
+        const rel = normalizeRel(entry.path);
+        if (!rel) continue;
+
+        const key = `${uploadPrefix}/${rel}`;
+        const contentType = mime.lookup(rel) || "application/octet-stream";
+
+        await new Promise((resolve, reject) => {
+          minioClient.putObject(
+            BUCKET,
+            key,
+            entry.stream(),
+            { "Content-Type": contentType },
+            (e, etag) => {
+              if (e) return reject(e);
+              uploadedCount += 1;
+              resolve(etag);
+            }
+          );
+        });
+      }
+
+      // 원본 폴더 삭제 (originalPrefix 아래 모든 파일)
+      let deletedCount = 0;
+      const deleteStream = minioClient.listObjectsV2(BUCKET, originalPrefix, true);
+
+      const filesToDelete = [];
+      deleteStream.on("data", (obj) => {
+        if (!obj?.name || obj.name.endsWith("/")) return;
+        filesToDelete.push(obj.name);
+      });
+
+      deleteStream.on("error", async (err) => {
+        // 삭제 실패해도 업로드는 성공했으므로 경고만 함
+        console.error("[ANNOTATION DELETE ERROR]", String(err));
+      });
+
+      deleteStream.on("end", async () => {
+        // 파일 삭제 (병렬 처리)
+        if (filesToDelete.length > 0) {
+          await Promise.all(
+            filesToDelete.map(
+              (key) =>
+                new Promise((resolve) => {
+                  minioClient.removeObject(BUCKET, key, (err) => {
+                    if (!err) deletedCount += 1;
+                    resolve();
+                  });
+                })
+            )
+          );
+        }
+
+        return res.json({
+          success: true,
+          bucket: BUCKET,
+          uploadPrefix,
+          uploadedCount,
+          originalPrefix,
+          deletedCount,
+          message: `Uploaded ${uploadedCount} files and deleted ${deletedCount} original files`,
+        });
+      });
+    } catch (e) {
+      return res.status(500).json({ success: false, err: e?.message || String(e) });
+    }
+  });
+});
+
+// List objects under a given prefix (useful to verify uploaded files)
+// query: prefix=productAnnotation/xxx
+router.get('/annotation/list-prefix', async (req, res) => {
+  try {
+    const minioClient = req.app.locals.minioClient;
+    const BUCKET = req.app.locals.minioBucket || 'chaiimage';
+    if (!minioClient) return res.status(500).json({ success: false, err: 'minioClient not initialized' });
+
+    const prefix = (req.query.prefix || '').toString();
+    if (!prefix) return res.status(400).json({ success: false, err: 'prefix is required' });
+
+    const items = [];
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
+    stream.on('data', (obj) => {
+      if (!obj?.name) return;
+      if (obj.name.endsWith('/')) return;
+      items.push({ key: obj.name, size: obj.size, etag: obj.etag });
+    });
+    stream.on('error', (err) => {
+      return res.status(500).json({ success: false, err: String(err) });
+    });
+    stream.on('end', () => {
+      return res.json({ success: true, bucket: BUCKET, prefix, count: items.length, items: items.slice(0, 100) });
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, err: e?.message || String(e) });
+  }
 });
 
 
