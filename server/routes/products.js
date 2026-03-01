@@ -21,39 +21,33 @@ function sha1(data) {
 async function notifyGPUServer(folderName) {
   try {
     // folderName format: {divisionIdx}_{storageType}_{trainingProductIdx}_{productIdx}
-    // 예: DE17560868094789999_C_40_P17701739459661615
     const parts = folderName.split('_').filter((p) => p !== '');
-    // divisionIdx is first element if it contains any letter, else undefined
-    let divisionIdx = '';
-    let productIdx = '';
-    if (parts.length > 0) {
-      // assume productIdx is last part that begins with 'P' or is numeric
-      productIdx = parts[parts.length - 1];
-      // divisionIdx as first non-numeric segment
-      for (const p of parts) {
-        if (!/^\d+$/.test(p) && !/^P\d+$/.test(p)) {
-          divisionIdx = p;
-          break;
-        }
-      }
-      if (!divisionIdx && parts.length >= 2) {
-        divisionIdx = parts[0];
-      }
-    }
 
-    if (!productIdx) {
-      console.error('[GPU_NOTIFY] Failed to extract product_idx from folderName:', folderName);
+    // for (const p of parts) {
+    //   if (!/^\d+$/.test(p) && !/^P\d+$/.test(p)) {
+    //     divisionIdx = p;
+    //     break;
+    //   }
+    // }
+    // if (!divisionIdx && parts.length >= 1) divisionIdx = parts[0];
+    const divisionIdx = parts[0];
+
+    // storageType 추출: 2번째 요소 사용
+    const storageType = parts[1]; // 명시적 일치 대신 고정 위치에서 추출
+    const productIdx = parts[3]; // productIdx는 4번째 요소로 고정
+
+    let isCold;
+    if (storageType === 'C') isCold = 'TRUE';
+    else if (storageType === 'F') isCold = 'FALSE';
+    else {
+      console.error('[GPU_NOTIFY] storageType not recognized in folderName:', folderName);
       return;
     }
-    if (!divisionIdx) {
-      // divisionIdx is optional; log warning but continue
-      console.warn('[GPU_NOTIFY] division_idx not found, using empty string');
-    }
 
-    // 시스템 ID 생성 (WEB-날짜-시퀀스)
+    // 시스템 ID/날짜 생성
     const now = new Date();
-    const dateStr = String(now.getFullYear()).slice(-2) + 
-                    String(now.getMonth() + 1).padStart(2, '0') + 
+    const dateStr = String(now.getFullYear()).slice(-2) +
+                    String(now.getMonth() + 1).padStart(2, '0') +
                     String(now.getDate()).padStart(2, '0');
     const timeStr = String(now.getHours()).padStart(2, '0') +
                     String(now.getMinutes()).padStart(2, '0') +
@@ -71,6 +65,7 @@ async function notifyGPUServer(folderName) {
       DATA: {
         division_idx: divisionIdx,
         product_idx: productIdx,
+        is_cold: isCold,
       },
     };
 
@@ -79,10 +74,10 @@ async function notifyGPUServer(folderName) {
     });
 
     console.log('[GPU_NOTIFY] Success:', response.data);
+    console.log('[GPU_NOTIFY] Payload sent:', payload);
     return response.data;
   } catch (e) {
     console.error('[GPU_NOTIFY] Error:', e?.message || String(e));
-    // 에러가 발생해도 업로드는 성공으로 처리 (비동기 알림)
   }
 }
 
@@ -95,7 +90,7 @@ async function notifyGPUServer(folderName) {
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    files: 2000,                 // 상한선
+    files: 5000,                 // 상한선
     fileSize: 100 * 1024 * 1024, // 100MB
   },
 }).array("files", 2000);
@@ -773,7 +768,7 @@ router.post("/annotation/upload-verified", (req, res) => {
             const contentType = mime.lookup(rel) || 'application/octet-stream';
 
             pending += 1;
-            console.log(`[ZIP_UPLOAD] processing entry ${entry.path} size=${entry.vars?.uncompressedSize || '?'} compressed=${entry.vars?.compressedSize || '?'} `);
+            // console.log(`[ZIP_UPLOAD] processing entry ${entry.path} size=${entry.vars?.uncompressedSize || '?'} compressed=${entry.vars?.compressedSize || '?'} `);
             try {
               // Collect entry into a PassThrough so we can determine if it's empty
               const tmp = new PassThrough();
@@ -808,7 +803,7 @@ router.post("/annotation/upload-verified", (req, res) => {
                       return reject(e);
                     }
                     uploadedCount += 1;
-                    console.log(`[ZIP_UPLOAD] uploaded ${entry.path}`);
+                    // console.log(`[ZIP_UPLOAD] uploaded ${entry.path}`);
                   });
                 } catch (e) {
                   pending -= 1;
