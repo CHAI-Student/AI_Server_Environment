@@ -256,13 +256,45 @@ function LandingPage() {
         <div style={sectionStyle}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
             <h2 style={{ color: '#87ceeb', margin: 0 }}>검수 대상 폴더 관리</h2>
-            <button
-              onClick={loadAllFolders}
-              disabled={loading}
-              style={{ ...buttonStyle, background: '#4CAF50', padding: '8px 16px' }}
-            >
-              {loading ? '로드 중...' : '새로고침'}
-            </button>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                onClick={loadAllFolders}
+                disabled={loading}
+                style={{ ...buttonStyle, background: '#4CAF50', padding: '8px 16px' }}
+              >
+                {loading ? '로드 중...' : '새로고침'}
+              </button>
+              <button
+                onClick={async (e) => {
+                  e.stopPropagation()
+                  // 다운로드 처리
+                  try {
+                    const resp = await fetch('/api/annotation/download-labels')
+                    if (!resp.ok) {
+                      let errMsg = resp.statusText
+                      try { const json = await resp.json(); if (json?.err) errMsg = json.err } catch {}
+                      setResponseMsg(`다운로드 실패: ${errMsg}`)
+                      return
+                    }
+                    const blob = await resp.blob()
+                    const url = URL.createObjectURL(blob)
+                    const a = document.createElement('a')
+                    a.href = url
+                    a.download = 'annotation-labels.json'
+                    document.body.appendChild(a)
+                    a.click()
+                    a.remove()
+                    URL.revokeObjectURL(url)
+                    setResponseMsg('annotation-labels.json 다운로드 완료')
+                  } catch (err) {
+                    setResponseMsg(`요청 실패: ${err?.message || String(err)}`)
+                  }
+                }}
+                style={{ ...buttonStyle, background: '#607D8B', padding: '8px 16px' }}
+              >
+                어노테이션 라벨 다운로드
+              </button>
+            </div>
           </div>
 
           {folders.length === 0 ? (

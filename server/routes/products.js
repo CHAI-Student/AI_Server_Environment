@@ -636,6 +636,48 @@ router.get("/annotation/download-zip", async (req, res) => {
   }
 });
 
+// 모든 AnnotationLabel 컬렉션의 내용을 JSON 파일로 내려받기
+router.get("/annotation/download-labels", async (req, res) => {
+  try {
+    const db = mongoose.connection.db;
+    if (!db) return res.status(500).json({ success: false, err: 'mongodb not initialized' });
+    const coll = db.collection('AnnotationLabel');
+    // 안전하게 비어있을 경우 빈 배열 반환
+    const docs = await coll.find({}).toArray();
+
+    // 재귀적으로 ObjectId나 {$oid: '...'} 같은 구조를 문자열로 바꿔줍니다.
+    const sanitize = (val) => {
+      if (val === null || val === undefined) return val;
+      if (Array.isArray(val)) return val.map(sanitize);
+      if (typeof val === 'object') {
+        if (typeof val.toHexString === 'function') return val.toHexString();
+        if (Object.prototype.hasOwnProperty.call(val, '$oid') && Object.keys(val).length === 1 && typeof val.$oid === 'string') return val.$oid;
+
+        const out = {};
+        for (const k of Object.keys(val)) {
+          out[k] = sanitize(val[k]);
+        }
+        return out;
+      }
+      return val;
+    };
+
+    const cleaned = docs.map((d) => sanitize(d));
+
+    // Remove MongoDB internal _id field from exported objects
+    const withoutId = cleaned.map(({ _id, ...rest }) => rest);
+
+    const filename = 'annotation-labels.json';
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+
+    return res.send(JSON.stringify(withoutId, null, 2));
+  } catch (e) {
+    return res.status(500).json({ success: false, err: (e && e.message) ? e.message : String(e) });
+  }
+});
+
 // 검수 완료 후 Zip 업로드
 const uploadZipAnnotation = multer({
   storage: multer.memoryStorage(),

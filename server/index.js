@@ -1,6 +1,7 @@
 const express = require("express");
 const app = express();
 const path = require("path");
+const fs = require("fs"); // used in routes and helpers
 const cors = require('cors')
 const axios = require('axios');
 
@@ -87,6 +88,22 @@ if (process.env.NODE_ENV === "production") {
 
 const port = process.env.PORT || 9000;
 
+// start server with error handling to avoid crashing on EADDRINUSE
+const server = app.listen(port, () => {
+  console.log(`Server Listening on ${port}`);
+  // 서버 시작 시 GPU 서버 헬스 체크 한 번 실행
+  checkGpuHealth();
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${port} is already in use. Another instance may be running.`);
+    process.exit(1);
+  } else {
+    console.error('Server error', err);
+  }
+});
+
 // GPU 서버 상태 확인 helper
 async function checkGpuHealth() {
   const url = 'http://139.150.8.82:2140/health';
@@ -109,11 +126,8 @@ app.get('/gpu-health', async (req, res) => {
     res.status(502).json({ success: false, err: 'gpu health check failed' });
   }
 });
-
-app.listen(port, () => {
-  console.log(`Server Listening on ${port}`);
-  // 서버 시작 시 GPU 서버 헬스 체크 한 번 실행
-  checkGpuHealth();
-  // 이후에는 주기적으로 확인하고 싶다면 아래처럼 설정
-  // setInterval(checkGpuHealth, 1000 * 60 * 5); // 5분마다
-});
+console.log(`Server Listening on ${port}`);
+// 서버 시작 시 GPU 서버 헬스 체크 한 번 실행
+checkGpuHealth();
+// 이후에는 주기적으로 확인하고 싶다면 아래처럼 설정
+// setInterval(checkGpuHealth, 1000 * 60 * 5); // 5분마다
