@@ -1,5 +1,6 @@
+/* eslint-disable no-console */ 
+
 import React, { useState, useEffect } from 'react'
-// landing page 컴포넌트에 사용되지 않는 외부 CSS는 주석 처리했습니다
 
 function LandingPage() {
   // 폴더 목록과 상태
