@@ -34,6 +34,7 @@ async function notifyGPUServer(folderName) {
 
     // storageType 추출: 2번째 요소 사용
     const storageType = parts[1]; // 명시적 일치 대신 고정 위치에서 추출
+    const trainProductIdx = parts[2]; // trainingProductIdx는 3번째 요소로 고정
     const productIdx = parts[3]; // productIdx는 4번째 요소로 고정
 
     let isCold;
@@ -65,6 +66,7 @@ async function notifyGPUServer(folderName) {
       DATA: {
         division_idx: divisionIdx,
         product_idx: productIdx,
+        train_product_idx: trainProductIdx,
         is_cold: isCold,
       },
     };
@@ -623,7 +625,11 @@ router.get("/annotation/download-zip", async (req, res) => {
 
           objStream.on("error", reject);
           const safeRel = rel.replace(/\\/g, "/").replace(/^\/*/, "").replace(/\.\./g, "_");
-          archive.append(objStream, { name: safeRel });
+          const normalizedSafeRel = safeRel.replace(/^\/*/, "");
+          const zipEntryName = normalizedSafeRel.startsWith(`${folderName}/`)
+            ? `${folderName}/${normalizedSafeRel.split(`${folderName}/`).slice(1).join(`${folderName}/`)}`
+            : `${folderName}/${normalizedSafeRel}`;
+          archive.append(objStream, { name: zipEntryName });
           resolve();
         });
       });
@@ -1204,7 +1210,8 @@ router.get("/annotation/download-new-zip", async (req, res) => {
     }
 
     const prefix = `NewAnnotation/${divisionIdx}_${trainingProductIdx}_${productIdx}`;
-    const zipName = `${divisionIdx}_${trainingProductIdx}_${productIdx}.zip`;
+    const folderName = `${divisionIdx}_${trainingProductIdx}_${productIdx}`;
+    const zipName = `${folderName}.zip`;
 
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
@@ -1225,14 +1232,18 @@ router.get("/annotation/download-new-zip", async (req, res) => {
         minioClient.getObject(BUCKET, key, (err, objStream) => {
           if (err) return reject(err);
 
-          // zip 내에서는 prefix 제거하고 상대경로로 저장
+          // zip 내에서는 상위 폴더명을 한 번만 붙여서 저장
           const rel = key.startsWith(prefix) ? key.slice(prefix.length) : key;
           if (!rel || rel.endsWith("/")) return resolve();
 
           objStream.on("error", reject);
 
           const safeRel = rel.replace(/\\/g, "/").replace(/^\/*/, "").replace(/\.\./g, "_");
-          archive.append(objStream, { name: safeRel });
+          const normalizedSafeRel = safeRel.replace(/^\/*/, "");
+          const zipEntryName = normalizedSafeRel.startsWith(`${folderName}/`)
+            ? `${folderName}/${normalizedSafeRel.split(`${folderName}/`).slice(1).join(`${folderName}/`)}`
+            : `${folderName}/${normalizedSafeRel}`;
+          archive.append(objStream, { name: zipEntryName });
           resolve();
         });
       });

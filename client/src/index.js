@@ -9,8 +9,8 @@ const container = document.getElementById("root");
 const root = createRoot(container);
 
 root.render(
-        <BrowserRouter basename="/chai">
-        {/* <BrowserRouter> */}
+        // <BrowserRouter basename="/chai">
+        <BrowserRouter>
                 <App />
         </BrowserRouter>
 );
