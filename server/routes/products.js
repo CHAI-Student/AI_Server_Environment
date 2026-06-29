@@ -516,17 +516,40 @@ router.get("/annotation/list-all", async (req, res) => {
 
       // attach product info from ProductsList
       const coll = mongoose.connection.db.collection('ProductsList');
+      console.log('[ANNOTATION LIST] Starting folder processing...');
+      
       await Promise.all(
         folders.map(async (f) => {
-          // extract productIdx: assume last segment after '_'
+          // 폴더 구조: DivisionIdx_StorageType_TrainingIdx_ProductIdx
           const parts = f.folderName.split('_');
-          const prod = parts[parts.length - 1];
-          f.productIdx = prod;
+          const trainProductIdx = parts[2] || '';
+          const productIdx = parts[parts.length - 1] || '';
+          
+          f.trainingProductIdx = trainProductIdx;
+          f.productIdx = productIdx;
+          f.productEngName = '';
+          
           try {
-            const doc = await coll.findOne({ productIdx: prod }, { projection: { productEngName: 1 } });
-            f.productEngName = doc?.productEngName || '';
-          } catch {
-            f.productEngName = '';
+            // 숫자로만 조회
+            const trainProductIdxNum = parseInt(trainProductIdx, 10);
+            if (isNaN(trainProductIdxNum)) {
+              console.log('[ANNOTATION LIST] Invalid trainProductIdx (not a number):', trainProductIdx);
+              return;
+            }
+
+            const doc = await coll.findOne(
+              { trainProductIdx: trainProductIdxNum },
+              { projection: { productEngName: 1, trainProductIdx: 1 } }
+            );
+            
+            if (doc?.productEngName) {
+              f.productEngName = doc.productEngName;
+              console.log('[ANNOTATION LIST] ✓ Found:', trainProductIdx, '->', doc.productEngName);
+            } else {
+              console.log('[ANNOTATION LIST] ✗ No match for trainProductIdx:', trainProductIdx);
+            }
+          } catch (err) {
+            console.error('[ANNOTATION LIST] Error querying MongoDB:', trainProductIdx, err.message);
           }
         })
       );
@@ -683,23 +706,109 @@ router.post("/annotation/upload-verified", (req, res) => {
   uploadZipAnnotation(req, res, async (err) => {
     // 요청이 들어왔음을 빠르게 찍어둠
     console.log('[UPLOAD_HANDLER] request received');
+
+    let clientAborted = false;
+    let uploadParser = null;
+    let bufferStream = null;
+    let minioClient = null;
+    let BUCKET = null;
+    let uploadPrefix = null;
+    let cleanupInProgress = false;
+    const activeTmpStreams = new Set();
+
+    const cleanupUploadPrefix = async () => {
+      if (cleanupInProgress || !minioClient || !BUCKET || !uploadPrefix) return;
+      cleanupInProgress = true;
+      try {
+        const cleanupPrefix = uploadPrefix.replace(/\/+$/, '') + '/';
+        const deleteKeys = [];
+        const deleteStream = minioClient.listObjectsV2(BUCKET, cleanupPrefix, true);
+
+        await new Promise((resolve, reject) => {
+          deleteStream.on('data', (obj) => {
+            if (!obj?.name || obj.name.endsWith('/')) return;
+            deleteKeys.push(obj.name);
+          });
+          deleteStream.on('error', reject);
+          deleteStream.on('end', resolve);
+        });
+
+        if (deleteKeys.length > 0) {
+          await Promise.all(
+            deleteKeys.map(
+              (key) =>
+                new Promise((resolve) => {
+                  minioClient.removeObject(BUCKET, key, (err) => {
+                    if (err) console.warn('[UPLOAD_HANDLER] cleanup removeObject failed:', key, err.message || err);
+                    resolve();
+                  });
+                })
+            )
+          );
+          console.warn('[UPLOAD_HANDLER] aborted upload cleanup completed:', deleteKeys.length, 'objects deleted');
+        }
+      } catch (cleanupErr) {
+        console.error('[UPLOAD_HANDLER] cleanup failed for aborted upload:', uploadPrefix, cleanupErr.message || cleanupErr);
+      }
+    };
+
+    const abortHandler = () => {
+      if (clientAborted) return;
+      clientAborted = true;
+      console.warn('[UPLOAD_HANDLER] request aborted by client');
+      if (uploadParser && !uploadParser.destroyed) {
+        try {
+          uploadParser.destroy(new Error('client aborted'));
+        } catch (e) {
+          console.warn('[UPLOAD_HANDLER] parser destroy failed:', e.message || e);
+        }
+      }
+      if (bufferStream && !bufferStream.destroyed) {
+        try {
+          bufferStream.destroy(new Error('client aborted'));
+        } catch (e) {
+          console.warn('[UPLOAD_HANDLER] bufferStream destroy failed:', e.message || e);
+        }
+      }
+      for (const tmp of activeTmpStreams) {
+        try {
+          tmp.destroy(new Error('client aborted'));
+        } catch (e) {
+          console.warn('[UPLOAD_HANDLER] tmp destroy failed:', e.message || e);
+        }
+      }
+      activeTmpStreams.clear();
+      cleanupUploadPrefix().catch((e) => {
+        console.error('[UPLOAD_HANDLER] abort cleanup error:', e.message || e);
+      });
+    };
+
+    req.on('aborted', abortHandler);
+    req.on('close', abortHandler);
+
     try {
       if (err) {
         console.error("[UPLOAD ERROR] Multer error:", err);
+        if (clientAborted) return;
         return res.status(400).json({ success: false, err: String(err) });
       }
 
-      const minioClient = req.app.locals.minioClient;
-      const BUCKET = req.app.locals.minioBucket || "chaiimage";
-      if (!minioClient) return res.status(500).json({ success: false, err: "minioClient not initialized" });
+      minioClient = req.app.locals.minioClient;
+      BUCKET = req.app.locals.minioBucket || "chaiimage";
+      if (!minioClient) {
+        if (clientAborted) return;
+        return res.status(500).json({ success: false, err: "minioClient not initialized" });
+      }
 
       const folderName = (req.body.folderName || "").toString();
       if (!folderName) {
+        if (clientAborted) return;
         return res.status(400).json({ success: false, err: "folderName is required" });
       }
 
       if (!req.file?.buffer) {
         console.error("[UPLOAD ERROR] No file buffer received");
+        if (clientAborted) return;
         return res.status(400).json({ success: false, err: "zip file is required (field name: zip)" });
       }
 
@@ -709,6 +818,7 @@ router.post("/annotation/upload-verified", (req, res) => {
       const productEngName = (req.body.productEngName || "").toString();
 
       if (!trainProductIdx || !productEngName) {
+        if (clientAborted) return;
         return res.status(400).json({
           success: false,
           err: "trainProductIdx and productEngName are required",
@@ -723,7 +833,7 @@ router.post("/annotation/upload-verified", (req, res) => {
       const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
       const dateTimeStr = `${date}_${time}`;
 
-      const uploadPrefix = `productAnnotation/${trainProductIdx}_${productEngName}_${dateTimeStr}`;
+      uploadPrefix = `productAnnotation/${trainProductIdx}_${productEngName}_${dateTimeStr}`;
 
       // Zip 풀어서 업로드 (streaming parse 사용)
       const normalizeRel = (p) =>
@@ -732,7 +842,11 @@ router.post("/annotation/upload-verified", (req, res) => {
           .replace(/^\/*/, "")
           .replace(/\.\./g, "_");
 
-      const bufferStream = new PassThrough();
+      bufferStream = new PassThrough();
+      bufferStream.on('error', (e) => {
+        if (clientAborted) return;
+        streamErr = e;
+      });
       bufferStream.end(req.file.buffer);
 
       let uploadedCount = 0;
@@ -741,103 +855,171 @@ router.post("/annotation/upload-verified", (req, res) => {
       let skippedFiles = []; // zero-length or errors
 
       await new Promise((resolve, reject) => {
-        bufferStream
-          .pipe(unzipper.Parse())
-          .on('entry', (entry) => {
-            if (streamErr) {
-              entry.autodrain();
-              return;
-            }
+        uploadParser = bufferStream.pipe(unzipper.Parse());
 
-            if (entry.type !== 'File') {
-              entry.autodrain();
-              return;
-            }
+        uploadParser.on('entry', (entry) => {
+          if (clientAborted) {
+            entry.autodrain();
+            return;
+          }
 
-            const rel = normalizeRel(entry.path);
-            if (!rel) {
-              entry.autodrain();
-              return;
-            }
+          if (streamErr) {
+            entry.autodrain();
+            return;
+          }
 
-            // Note: do not skip based on entry.vars here; we'll inspect actual stream bytes
-            // to determine zero-length entries. Some archives report 0 in metadata
-            // even though data exists, so rely on streaming bytes instead.
+          if (entry.type !== 'File') {
+            entry.autodrain();
+            return;
+          }
 
-            const key = `${uploadPrefix}/${rel}`;
-            const contentType = mime.lookup(rel) || 'application/octet-stream';
+          const rel = normalizeRel(entry.path);
+          if (!rel) {
+            entry.autodrain();
+            return;
+          }
 
-            pending += 1;
-            // console.log(`[ZIP_UPLOAD] processing entry ${entry.path} size=${entry.vars?.uncompressedSize || '?'} compressed=${entry.vars?.compressedSize || '?'} `);
-            try {
-              // Collect entry into a PassThrough so we can determine if it's empty
-              const tmp = new PassThrough();
-              let totalBytes = 0;
+          // Note: do not skip based on entry.vars here; we'll inspect actual stream bytes
+          // to determine zero-length entries. Some archives report 0 in metadata
+          // even though data exists, so rely on streaming bytes instead.
 
-              entry.on('data', (chunk) => {
-                totalBytes += chunk.length;
-                tmp.write(chunk);
-              });
+          const key = `${uploadPrefix}/${rel}`;
+          const contentType = mime.lookup(rel) || 'application/octet-stream';
 
-              entry.on('end', () => {
-                tmp.end();
+          pending += 1;
+          // console.log(`[ZIP_UPLOAD] processing entry ${entry.path} size=${entry.vars?.uncompressedSize || '?'} compressed=${entry.vars?.compressedSize || '?'} `);
+          try {
+            const tmp = new PassThrough();
+            activeTmpStreams.add(tmp);
+            tmp.on('error', (e) => {
+              if (clientAborted) return;
+              streamErr = e;
+            });
+            let totalBytes = 0;
+            let entryCanceled = false;
 
-                if (totalBytes === 0) {
-                  console.warn('[ZIP_UPLOAD] skipping zero-length file (stream) ', entry.path);
-                  skippedFiles.push(entry.path);
+            entry.on('data', (chunk) => {
+              if (clientAborted) {
+                entryCanceled = true;
+                try { entry.destroy(new Error('client aborted')); } catch (e) {}
+                return;
+              }
+              totalBytes += chunk.length;
+              tmp.write(chunk);
+            });
+
+            entry.on('end', () => {
+              if (clientAborted || entryCanceled) {
+                tmp.destroy(new Error('client aborted'));
+                activeTmpStreams.delete(tmp);
+                pending -= 1;
+                return;
+              }
+
+              tmp.end();
+
+              if (totalBytes === 0) {
+                console.warn('[ZIP_UPLOAD] skipping zero-length file (stream) ', entry.path);
+                skippedFiles.push(entry.path);
+                activeTmpStreams.delete(tmp);
+                pending -= 1;
+                return;
+              }
+
+              try {
+                minioClient.putObject(BUCKET, key, tmp, { 'Content-Type': contentType }, (e, etag) => {
+                  activeTmpStreams.delete(tmp);
                   pending -= 1;
-                  return;
-                }
-
-                // now upload the collected stream to MinIO
-                try {
-                  minioClient.putObject(BUCKET, key, tmp, { 'Content-Type': contentType }, (e, etag) => {
-                    pending -= 1;
-                    if (e) {
-                      console.error(`[ZIP_UPLOAD] putObject error for ${entry.path}:`, e.message);
-                      if (e.message && e.message.includes('You must specify at least one part')) {
-                        console.warn(`[ZIP_UPLOAD] skipping empty entry ${entry.path}`);
-                        return;
-                      }
-                      streamErr = e;
-                      return reject(e);
+                  if (clientAborted) {
+                    tmp.destroy(new Error('client aborted'));
+                    return;
+                  }
+                  if (e) {
+                    console.error(`[ZIP_UPLOAD] putObject error for ${entry.path}:`, e.message);
+                    if (e.message && e.message.includes('You must specify at least one part')) {
+                      console.warn(`[ZIP_UPLOAD] skipping empty entry ${entry.path}`);
+                      return;
                     }
-                    uploadedCount += 1;
-                    // console.log(`[ZIP_UPLOAD] uploaded ${entry.path}`);
-                  });
-                } catch (e) {
-                  pending -= 1;
-                  streamErr = e;
-                  return reject(e);
-                }
-              });
-
-              entry.on('error', (e) => {
-                tmp.end();
+                    streamErr = e;
+                    return reject(e);
+                  }
+                  uploadedCount += 1;
+                  // console.log(`[ZIP_UPLOAD] uploaded ${entry.path}`);
+                });
+              } catch (e) {
+                activeTmpStreams.delete(tmp);
                 pending -= 1;
                 streamErr = e;
                 return reject(e);
-              });
-            } catch (e) {
+              }
+            });
+
+            entry.on('error', (e) => {
+              tmp.end();
               pending -= 1;
               streamErr = e;
-              entry.autodrain();
               return reject(e);
-            }
-          })
-          .on('close', () => {
-            if (streamErr) return reject(streamErr);
-            const wait = () => {
-              if (pending === 0) return resolve();
-              setTimeout(wait, 50);
-            };
-            wait();
-          })
-          .on('error', (e) => {
+            });
+          } catch (e) {
+            pending -= 1;
             streamErr = e;
+            entry.autodrain();
             return reject(e);
-          });
+          }
+        });
+
+        uploadParser.on('error', (e) => {
+          if (clientAborted) return resolve();
+          streamErr = e;
+          return reject(e);
+        });
+
+        uploadParser.on('close', () => {
+          if (clientAborted) return resolve();
+          if (streamErr) return reject(streamErr);
+          const wait = () => {
+            if (pending === 0) return resolve();
+            setTimeout(wait, 50);
+          };
+          wait();
+        });
       });
+
+      // 클라이언트가 취소했으면 응답하지 않고 업로드된 임시 파일 삭제 후 종료
+      if (clientAborted) {
+        console.warn('[UPLOAD_HANDLER] client aborted before response, cleaning up uploaded prefix:', uploadPrefix);
+        try {
+          const deleteKeys = [];
+          const deleteStream = minioClient.listObjectsV2(BUCKET, uploadPrefix, true);
+
+          await new Promise((resolve, reject) => {
+            deleteStream.on('data', (obj) => {
+              if (!obj?.name || obj.name.endsWith('/')) return;
+              deleteKeys.push(obj.name);
+            });
+            deleteStream.on('error', reject);
+            deleteStream.on('end', resolve);
+          });
+
+          if (deleteKeys.length > 0) {
+            await Promise.all(
+              deleteKeys.map(
+                (key) =>
+                  new Promise((resolve) => {
+                    minioClient.removeObject(BUCKET, key, (err) => {
+                      if (err) console.warn('[UPLOAD_HANDLER] cleanup removeObject failed:', key, err.message || err);
+                      resolve();
+                    });
+                  })
+              )
+            );
+            console.warn('[UPLOAD_HANDLER] aborted upload cleanup completed:', deleteKeys.length, 'objects deleted');
+          }
+        } catch (cleanupErr) {
+          console.error('[UPLOAD_HANDLER] cleanup failed for aborted upload:', uploadPrefix, cleanupErr.message || cleanupErr);
+        }
+        return;
+      }
 
       // 응답 전송
       if (uploadedCount === 0) {
@@ -857,23 +1039,25 @@ router.post("/annotation/upload-verified", (req, res) => {
         });
       }
 
-      res.json({
-        success: true,
-        bucket: BUCKET,
-        uploadPrefix,
-        uploadedCount,
-        folderName,
-        skippedCount: skippedFiles.length,
-        skipped: skippedFiles.length > 0 ? skippedFiles.slice(0,10) : undefined,
-        message: `Uploaded ${uploadedCount} files to ${uploadPrefix}`,
-      });
-
-      // 비동기로 GPU 서버에 알림 전송 (응답 후 백그라운드에서 실행)
-      setImmediate(() => {
-        notifyGPUServer(folderName).catch((e) => {
-          console.error('[GPU_NOTIFY] Error notification failed:', e?.message || String(e));
+      if (!clientAborted) {
+        res.json({
+          success: true,
+          bucket: BUCKET,
+          uploadPrefix,
+          uploadedCount,
+          folderName,
+          skippedCount: skippedFiles.length,
+          skipped: skippedFiles.length > 0 ? skippedFiles.slice(0,10) : undefined,
+          message: `Uploaded ${uploadedCount} files to ${uploadPrefix}`,
         });
-      });
+
+        // 비동기로 GPU 서버에 알림 전송 (응답 후 백그라운드에서 실행)
+        setImmediate(() => {
+          notifyGPUServer(folderName).catch((e) => {
+            console.error('[GPU_NOTIFY] Error notification failed:', e?.message || String(e));
+          });
+        });
+      }
     } catch (e) {
       return res.status(500).json({ success: false, err: e?.message || String(e) });
     }

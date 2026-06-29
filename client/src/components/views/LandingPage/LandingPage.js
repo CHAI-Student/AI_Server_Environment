@@ -21,6 +21,9 @@ function LandingPage() {
   const [deleteLoading, setDeleteLoading] = useState(new Set())
   const [pendingUploadFolder, setPendingUploadFolder] = useState(null)
   const [confirmDelete, setConfirmDelete] = useState(null)
+  const [uploadAbortController, setUploadAbortController] = useState(null) // 업로드 취소용 controller
+  const [showCancelPopup, setShowCancelPopup] = useState(false)
+  const [showSuccessPopup, setShowSuccessPopup] = useState(false)
 
   // 초기 로드: 모든 폴더 조회 + 로컬스토리지에서 업로드 상태 복원
   useEffect(() => {
@@ -61,18 +64,14 @@ function LandingPage() {
   // 폴더 선택
   const handleSelectFolder = (folder) => {
     setSelectedFolder(folder)
-    // 자동 채우기: productEngName, trainProductIdx extracted from name
+    // 자동 채우기: productEngName, trainingProductIdx
     setProductEngName(folder.productEngName || '')
-    // robust extraction: ignore empty segments, productIdx is last, trainingProductIdx is first numeric segment
+    // 폴더 구조: DivisionIdx_StorageType_TrainingIdx_ProductIdx
     const rawParts = String(folder.folderName || '').split('_');
     const parts = rawParts.filter((p) => p !== '');
-    let inferredTrain = '';
-    if (parts.length > 0) {
-      const numeric = parts.find((p) => /^\d+$/.test(p));
-      if (numeric) inferredTrain = numeric;
-      else if (parts.length >= 2) inferredTrain = parts[1];
-    }
-    if (inferredTrain) setTrainProductIdx(inferredTrain)
+    // parts[2]가 TrainingIdx
+    const trainingIdx = parts[2] || '';
+    if (trainingIdx) setTrainProductIdx(trainingIdx)
     setZipFile(null)
   }
 
@@ -129,13 +128,11 @@ function LandingPage() {
     }
 
     // trainProductIdx와 productEngName은 폴더 정보에서 자동 추출
+    // 폴더 구조: DivisionIdx_StorageType_TrainingIdx_ProductIdx
     const rawParts = String(folder.folderName || '').split('_');
     const parts = rawParts.filter((p) => p !== '');
     const productIdx = parts[parts.length - 1] || folder.productIdx || ''
-    let trainingProductIdx = '';
-    const numeric = parts.find((p) => /^\d+$/.test(p));
-    if (numeric) trainingProductIdx = numeric;
-    else if (parts.length >= 2) trainingProductIdx = parts[1];
+    const trainingProductIdx = parts[2] || folder.trainingProductIdx || '';
     const productName = folder.productEngName || ''
 
     if (!trainingProductIdx || !productName) {
@@ -160,14 +157,22 @@ function LandingPage() {
         fileType: uploadFile.type,
       })
 
+      // AbortController 생성
+      const controller = new AbortController()
+      setUploadAbortController(controller)
+
       const response = await fetch('/api/annotation/upload-verified', {
         method: 'POST',
         body: formData,
+        signal: controller.signal, // 취소 가능하게 설정
       })
       const data = await response.json()
+      setUploadAbortController(null)
 
       if (data.success) {
-        setResponseMsg(`업로드 성공! ${data.uploadedCount}개 파일이 저장되었습니다`) 
+        setResponseMsg(`업로드 성공! ${data.uploadedCount}개 파일이 저장되었습니다`)
+        setShowSuccessPopup(true)
+        window.setTimeout(() => setShowSuccessPopup(false), 3000)
         const newUploadedFolders = new Set(uploadedFolders)
         newUploadedFolders.add(folder.folderName)
         setUploadedFolders(newUploadedFolders)
@@ -180,9 +185,25 @@ function LandingPage() {
         setResponseMsg(`업로드 실패: ${data.err}`)
       }
     } catch (e) {
-      setResponseMsg(`요청 실패: ${e.message}`)
+      if (e.name === 'AbortError') {
+        setResponseMsg('업로드가 취소되었습니다')
+      } else {
+        setResponseMsg(`요청 실패: ${e.message}`)
+      }
     } finally {
       setUploadLoading(false)
+      setUploadAbortController(null)
+    }
+  }
+
+  // 업로드 취소
+  const handleCancelUpload = () => {
+    if (uploadAbortController) {
+      uploadAbortController.abort()
+      setUploadAbortController(null)
+      setUploadLoading(false)
+      setShowCancelPopup(true)
+      window.setTimeout(() => setShowCancelPopup(false), 3000)
     }
   }
 
@@ -388,6 +409,17 @@ function LandingPage() {
                             >
                               {uploadLoading && pendingUploadFolder?.folderName === folder.folderName ? '업로드 중...' : uploadedFolders.has(folder.folderName) ? '업로드 완료' : '검수 완료'}
                             </button>
+                            {uploadLoading && pendingUploadFolder?.folderName === folder.folderName && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleCancelUpload()
+                                }}
+                                style={{ ...miniButtonStyle, background: '#f44336' }}
+                              >
+                                취소
+                              </button>
+                            )}
                             {uploadedFolders.has(folder.folderName) && (
                               <button
                                 onClick={(e) => {
@@ -453,6 +485,44 @@ function LandingPage() {
             wordBreak: 'break-word'
           }}>
             {responseMsg}
+          </div>
+        )}
+        {showSuccessPopup && (
+          <div style={{
+            position: 'fixed',
+            left: '50%',
+            top: '20px',
+            transform: 'translateX(-50%)',
+            zIndex: 999,
+            background: '#1b5e20',
+            color: '#fff',
+            padding: '14px 22px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 18px rgba(0,0,0,0.3)',
+            border: '1px solid #4CAF50',
+            minWidth: '260px',
+            textAlign: 'center'
+          }}>
+            업로드가 성공했습니다.
+          </div>
+        )}
+        {showCancelPopup && (
+          <div style={{
+            position: 'fixed',
+            left: '50%',
+            top: '20px',
+            transform: 'translateX(-50%)',
+            zIndex: 999,
+            background: '#333',
+            color: '#fff',
+            padding: '14px 22px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 18px rgba(0,0,0,0.3)',
+            border: '1px solid #666',
+            minWidth: '260px',
+            textAlign: 'center'
+          }}>
+            업로드가 취소되었습니다.
           </div>
         )}
       </div>
