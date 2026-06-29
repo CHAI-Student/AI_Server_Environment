@@ -790,7 +790,10 @@ router.post("/annotation/upload-verified", (req, res) => {
     };
 
     req.on('aborted', abortHandler);
-    req.on('close', abortHandler);
+    // close는 제거하거나, aborted일 때만 처리
+    req.on('close', () => {
+      if (req.aborted) abortHandler();
+    });
 
     try {
       if (err) {
