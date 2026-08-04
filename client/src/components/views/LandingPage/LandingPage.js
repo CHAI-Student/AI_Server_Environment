@@ -357,7 +357,7 @@ function LandingPage() {
                 <thead>
                   <tr style={{ background: '#1a1a1a', borderBottom: '2px solid #555' }}>
                     <th style={thStyle}>폴더명</th>                    
-                    <th style={thStyle}>상품ID</th>                    
+                    {/* <th style={thStyle}>상품ID</th>                     */}
                     <th style={thStyle}>상품 영문명</th>
                     <th style={thStyle}>파일 개수</th>
                     <th style={thStyle}>용량</th>
@@ -384,7 +384,7 @@ function LandingPage() {
                             {folder.folderName}
                           </span>
                         </td>
-                        <td style={tdStyle}>{folder.productIdx || '-'}</td>
+                        {/* <td style={tdStyle}>{folder.productIdx || '-'}</td> */}
                         <td style={tdStyle}>{folder.productEngName || '-'}</td>
                         <td style={tdStyle}>{folder.fileCount}개</td>
                         <td style={tdStyle}>{(folder.totalSize / (1024 * 1024)).toFixed(1)}MB</td>
