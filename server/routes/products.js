@@ -851,17 +851,17 @@ router.post("/annotation/upload-verified", (req, res) => {
           .replace(/^\/*/, "")
           .replace(/\.\./g, "_");
 
+      let uploadedCount = 0;
+      let pending = 0;
+      let streamErr = null;
+      let skippedFiles = []; // zero-length or errors
+
       bufferStream = new PassThrough();
       bufferStream.on('error', (e) => {
         if (clientAborted) return;
         streamErr = e;
       });
       bufferStream.end(req.file.buffer);
-
-      let uploadedCount = 0;
-      let pending = 0;
-      let streamErr = null;
-      let skippedFiles = []; // zero-length or errors
 
       await new Promise((resolve, reject) => {
         uploadParser = bufferStream.pipe(unzipper.Parse());
@@ -935,23 +935,44 @@ router.post("/annotation/upload-verified", (req, res) => {
                 return;
               }
 
+              console.log(
+                `[ZIP_UPLOAD] uploading ${entry.path}, ` +
+                `size=${totalBytes} bytes`
+              );
+
               try {
-                minioClient.putObject(BUCKET, key, tmp, { 'Content-Type': contentType }, (e, etag) => {
+                minioClient.putObject(BUCKET, key, tmp, totalBytes, { 'Content-Type': contentType }, (e, etag) => {
                   activeTmpStreams.delete(tmp);
                   pending -= 1;
                   if (clientAborted) {
                     tmp.destroy(new Error('client aborted'));
                     return;
                   }
+                  // if (e) {
+                  //   console.error(`[ZIP_UPLOAD] putObject error for ${entry.path}:`, e.message);
+                  //   if (e.message && e.message.includes('You must specify at least one part')) {
+                  //     console.warn(`[ZIP_UPLOAD] skipping empty entry ${entry.path}`);
+                  //     return;
+                  //   }
+                  //   streamErr = e;
+                  //   return reject(e);
+                  // }
                   if (e) {
-                    console.error(`[ZIP_UPLOAD] putObject error for ${entry.path}:`, e.message);
-                    if (e.message && e.message.includes('You must specify at least one part')) {
-                      console.warn(`[ZIP_UPLOAD] skipping empty entry ${entry.path}`);
-                      return;
-                    }
+                    console.error(
+                      `[ZIP_UPLOAD] putObject error: ${entry.path}`,
+                      {
+                        totalBytes,
+                        error: e
+                      }
+                    );
+
                     streamErr = e;
                     return reject(e);
                   }
+
+                  console.log(
+                    `[ZIP_UPLOAD] success: ${entry.path}, size=${totalBytes}`
+                  );
                   uploadedCount += 1;
                   // console.log(`[ZIP_UPLOAD] uploaded ${entry.path}`);
                 });
